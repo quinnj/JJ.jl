@@ -1,6 +1,6 @@
 module JJ
 
-using SIMD
+using SIMD, Mmap
 
 @generated function compress(bm::Vec{32, Bool})
     decl = "declare i32 @llvm.x86.avx2.pmovmskb(<32 x i8>)"
@@ -20,12 +20,13 @@ using SIMD
     end
 end
 
-# compress(bm) = ccall("llvm.x86.avx2.pmovmskb", llvmcall, UInt32, (NTuple{32, Base.VecElement{Bool}},), bm.elts)
+compress(bm) = ccall("llvm.x86.avx2.pmovmskb", llvmcall, UInt32, (NTuple{32, Base.VecElement{Bool}},), bm.elts)
+_mm256_cmpeq_epi8(a, b) = ccall("llvm.x86.avx2.vpcmpeqb", llvmcall, Vec{32, UInt8}, (NTuple{32, Base.VecElement{UInt8}}, NTuple{32, Base.VecElement{UInt8}}), a.elts, b.elts)
 _mm256_shuffle_epi8(a, b) = ccall("llvm.x86.avx2.pshuf.b", llvmcall, Vec{32, UInt8}, (NTuple{32, Base.VecElement{UInt8}}, NTuple{32, Base.VecElement{UInt8}}), a.elts, b.elts)
 _mm_clmulepi64_si128(a, b) = ccall("llvm.x86.pclmulqdq", llvmcall, Vec{16, UInt8}, (NTuple{16, Base.VecElement{UInt8}}, NTuple{16, Base.VecElement{UInt8}}, Int32), a.elts, b.elts, 0)
 
 const DEFAULTMAXDEPTH = 1024
-roundup_n(a, n) = (((a) + ((n)-1)) & ~((n)-1))
+roundup_n(a, n) = (a + (n - 1)) & ~(n - 1)
 
 function build_parsed_json(buf::Vector{UInt8})
     pj = ParsedJson()
@@ -77,11 +78,11 @@ function allocateCapacity!(pj, len, maxdepth=DEFAULTMAXDEPTH)
     bytecapacity = 0
     pj.n_structural_indexes = 0
     max_structures = roundup_n(len, 64) + 2 + 7
-    pj.structural_indexes = zeros(UInt32, max_structures)
+    pj.structural_indexes = Mmap.mmap(Vector{UInt32}, max_structures)
     localtapecapacity = roundup_n(len, 64)
     localstringcapacity = roundup_n(div(5 * len, 3) + 32, 64)
-    pj.string_buf = zeros(UInt8, localstringcapacity)
-    pj.tape = zeros(UInt64, localtapecapacity)
+    pj.string_buf = Mmap.mmap(Vector{UInt8}, localstringcapacity)
+    pj.tape = Mmap.mmap(Vector{UInt64}, localtapecapacity)
     pj.containing_scope_offset = zeros(UInt32, maxdepth)
     pj.ret_address = fill(Ptr{Cvoid}(0), maxdepth)
     pj.bytecapacity = len
@@ -106,8 +107,6 @@ function find_structural_bits!(bytes::Vector{UInt8}, pj)
     error_mask = UInt64(0)
     while idx < lenminus64
         ccall("llvm.prefetch", llvmcall, Cvoid, (Ptr{UInt8}, Int32, Int32, Int32), buf + idx + UInt32(128), Int32(0), Int32(3), Int32(1))
-        #TODO: __builtin_prefetch buf Ptr{UInt8} data
-        # input_lo/input_hi are effectively zeros(UInt8, 32)
         input_lo = vload(Vec{32, UInt8}, buf + idx)
         input_hi = vload(Vec{32, UInt8}, buf + idx + 32)
         odd_ends, prev_iter_ends_odd_backslash = find_odd_backslash_sequences(input_lo, input_hi, prev_iter_ends_odd_backslash)
@@ -119,9 +118,6 @@ function find_structural_bits!(bytes::Vector{UInt8}, pj)
     end
 
     if idx < len
-        # uint8_t tmpbuf[64];
-        # memset(tmpbuf, 0x20, 64);
-        # memcpy(tmpbuf, buf + idx, len - idx);
         input_lo = vload(Vec{32, UInt8}, buf + idx)
         input_hi = vload(Vec{32, UInt8}, buf + idx + 32)
         odd_ends, prev_iter_ends_odd_backslash = find_odd_backslash_sequences(input_lo, input_hi, prev_iter_ends_odd_backslash)
@@ -149,17 +145,15 @@ function find_structural_bits!(bytes::Vector{UInt8}, pj)
 end
 
 function cmp_mask_against_input(input_lo, input_hi, mask)
-    cmp_res_0 = input_lo == mask
-    res_0 = compress(cmp_res_0)
-    cmp_res_1 = input_hi == mask
-    res_1 = compress(cmp_res_1)
-    return res_0 | (res_1 << 32)
+    res_0 = compress(input_lo == mask)
+    res_1 = compress(input_hi == mask)
+    return UInt64(res_0) | (UInt64(res_1) << 32)
 end
 
 function find_odd_backslash_sequences(input_lo, input_hi, prev_iter_ends_odd_backslash)
-    even_bits::UInt64 = 0x5555555555555555
-    odd_bits::UInt64 = ~even_bits
-    bs_bits::UInt64 = cmp_mask_against_input(input_lo, input_hi, Vec{32, UInt8}('\\' % UInt8))
+    even_bits = 0x5555555555555555
+    odd_bits = ~even_bits
+    bs_bits = cmp_mask_against_input(input_lo, input_hi, Vec{32, UInt8}('\\' % UInt8))
     start_edges::UInt64 = bs_bits & ~(bs_bits << 1)
     even_start_mask::UInt64 = xor(even_bits, prev_iter_ends_odd_backslash)
     even_starts::UInt64 = start_edges & even_start_mask
@@ -187,7 +181,12 @@ end
 function find_quote_mask_and_bits(input_lo, input_hi, odd_ends, prev_iter_inside_quote, error_mask)
     quote_bits = cmp_mask_against_input(input_lo, input_hi, Vec{32, UInt8}('"' % UInt8))
     quote_bits = quote_bits & ~odd_ends
-    quote_mask::UInt64 = reinterpret(Vec{2, UInt64}, _mm_clmulepi64_si128(reinterpret(Vec{16, UInt8}, Vec{2, UInt64}((UInt64(0), quote_bits))), Vec{16, UInt8}(0xFF)))[1]
+    quote_mask = reinterpret(Vec{2, UInt64}, 
+                            _mm_clmulepi64_si128(
+                                reinterpret(Vec{16, UInt8}, Vec{2, UInt64}((quote_bits, UInt64(0)))),
+                                Vec{16, UInt8}(0xFF)
+                            )
+                         )[1]
     quote_mask = xor(quote_mask, prev_iter_inside_quote)
     unescaped::UInt64 = unsigned_lteq_against_input(input_lo, input_hi, Vec{32, UInt8}(0x1F))
     error_mask |= quote_mask & unescaped
@@ -237,15 +236,15 @@ function find_whitespace_and_structurals(input_lo, input_hi, structurals)
     tmp_lo = (v_lo & structural_shufti_mask) == zeros
     tmp_hi = (v_hi & structural_shufti_mask) == zeros
 
-    structural_res_0 = compress(tmp_lo)
-    structural_res_1 = compress(tmp_hi)
+    structural_res_0 = UInt64(compress(tmp_lo))
+    structural_res_1 = UInt64(compress(tmp_hi))
     structurals = ~(structural_res_0 | (structural_res_1 << 32))
 
     tmp_ws_lo = (v_lo & whitespace_shufti_mask) == zeros
     tmp_ws_hi = (v_hi & whitespace_shufti_mask) == zeros
 
-    ws_res_0 = compress(tmp_ws_lo)
-    ws_res_1 = compress(tmp_ws_hi)
+    ws_res_0 = UInt64(compress(tmp_ws_lo))
+    ws_res_1 = UInt64(compress(tmp_ws_hi))
     whitespace = ~(ws_res_0 | (ws_res_1 << 32))
     return whitespace, structurals
 end
